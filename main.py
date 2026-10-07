@@ -3,6 +3,7 @@ from pathlib import Path
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql import types as T
+from pyspark.sql import DataFrame, Window
 
 INPUT_FILE = Path("data/input/orders.csv")
 OUTPUT_DIRECTORY = Path("data/output/daily_revenue")
@@ -27,6 +28,75 @@ ORDER_SCHEMA = T.StructType(
     ]
 )
 
+def validate_orders(
+    orders: DataFrame,
+) -> tuple[DataFrame, DataFrame]:
+    order_id_window = Window.partitionBy("order_id")
+
+    validated = orders.withColumn(
+        "_order_id_count",
+        F.count("*").over(order_id_window),
+    )
+
+    duplicate_condition = (
+        F.col("order_id").isNotNull()
+        & (F.col("_order_id_count") > 1)
+    )
+
+    validated = validated.withColumn(
+        "rejection_reason",
+        F.concat_ws(
+            ", ",
+            F.when(
+                F.col("order_id").isNull(),
+                F.lit("missing_order_id"),
+            ),
+            F.when(
+                duplicate_condition,
+                F.lit("duplicate_order_id"),
+            ),
+            F.when(
+                F.col("order_date").isNull(),
+                F.lit("missing_order_date"),
+            ),
+            F.when(
+                F.col("quantity").isNull(),
+                F.lit("missing_quantity"),
+            ),
+            F.when(
+                F.col("quantity") <= 0,
+                F.lit("quantity_must_be_positive"),
+            ),
+            F.when(
+                F.col("unit_price").isNull(),
+                F.lit("missign_unit_price"),
+            ),
+            F.when(
+                F.col("unit_price") < 0,
+                F.lit("unit_price_must_be_non_negative"),
+            ),
+            F.when(
+                F.col("customer_country").isNull()
+                | (F.trim(F.col("customer_country")) == ""),
+                F.lit("missing_customer_country")
+            ),
+        ),
+    )
+
+    valid_orders = (
+        validated
+        .filter(F.col("rejection_reason") == "")
+        .drop("_order_id_count", "rejection_reason")
+    )
+
+    rejected_orders = (
+        validated
+        .filter(F.col("rejection_reason") != "")
+        .drop("_order_id_count")
+    )
+
+    return valid_orders, rejected_orders
+
 def create_spark_session() -> SparkSession:
     return (
         SparkSession.builder
@@ -47,10 +117,15 @@ def main() -> None:
             .csv(str(INPUT_FILE))
         )
 
+        valid_orders, rejected_orders = validate_orders(orders)
+
         print("Input schema:")
         orders.printSchema()
 
-        completed_orders = orders.filter(
+        print("Rejected orders:")
+        rejected_orders.show(truncate=False)
+
+        completed_orders = valid_orders.filter(
             F.col("status") == "Completed"
         )
 
@@ -76,10 +151,23 @@ def main() -> None:
 
         print("Daily revenue:")
         daily_revenue.show(truncate=False)
+
         (
             daily_revenue.write
             .mode("overwrite")
             .parquet(str(OUTPUT_DIRECTORY))
+        )
+
+        (
+            valid_orders.write
+            .mode("overwrite")
+            .parquet("data/output/valid_orders")
+        )
+
+        (
+            rejected_orders.write
+            .mode("overwrite")
+            .parquet("data/output/rejected_orders")
         )
     finally:
         spark.stop()
