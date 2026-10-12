@@ -105,6 +105,24 @@ def create_spark_session() -> SparkSession:
         .getOrCreate()
     )
 
+def calculate_daily_revenue(orders: DataFrame) -> DataFrame:
+    return (
+        orders
+        .filter(F.col("status") == "Completed")
+        .withColumn(
+            "line_total",
+            F.round(
+                F.col("quantity") * F.col("unit_price"),
+                2,
+            ),
+        )
+        .groupBy("order_date", "customer_country")
+        .agg(F.sum("line_total").alias("revenue"))
+        .orderBy("order_date", "customer_country")
+    )
+        
+
+
 def main() -> None:
     spark = create_spark_session()
 
@@ -125,27 +143,8 @@ def main() -> None:
         print("Rejected orders:")
         rejected_orders.show(truncate=False)
 
-        completed_orders = valid_orders.filter(
-            F.col("status") == "Completed"
-        )
-
-        orders_with_total = completed_orders.withColumn(
-            "line_total",
-            F.round(
-                F.col("quantity") * F.col("unit_price"),
-                2,
-            ),
-        )
-
-        daily_revenue = (
-            orders_with_total
-            .groupBy("order_date", "customer_country")
-            .agg(
-                F.sum("line_total").alias("revenue")
-            )
-            .orderBy("order_date", "customer_country")
-        )
-
+        daily_revenue = calculate_daily_revenue(orders)
+        
         print("Execution plan:")
         daily_revenue.explain(mode="formatted")
 
