@@ -4,6 +4,7 @@ from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql import types as T
 from pyspark.sql import DataFrame, Window
+from pyspark import StorageLevel
 
 INPUT_FILE = Path("data/input/orders.csv")
 OUTPUT_DIRECTORY = Path("data/output/daily_revenue")
@@ -28,9 +29,7 @@ ORDER_SCHEMA = T.StructType(
     ]
 )
 
-def validate_orders(
-    orders: DataFrame,
-) -> tuple[DataFrame, DataFrame]:
+def build_validated_orders(orders: DataFrame) -> DataFrame:
     order_id_window = Window.partitionBy("order_id")
 
     validated = orders.withColumn(
@@ -43,59 +42,70 @@ def validate_orders(
         & (F.col("_order_id_count") > 1)
     )
 
-    validated = validated.withColumn(
-        "rejection_reason",
-        F.concat_ws(
-            ", ",
-            F.when(
-                F.col("order_id").isNull(),
-                F.lit("missing_order_id"),
-            ),
-            F.when(
-                duplicate_condition,
-                F.lit("duplicate_order_id"),
-            ),
-            F.when(
-                F.col("order_date").isNull(),
-                F.lit("missing_order_date"),
-            ),
-            F.when(
-                F.col("quantity").isNull(),
-                F.lit("missing_quantity"),
-            ),
-            F.when(
-                F.col("quantity") <= 0,
-                F.lit("quantity_must_be_positive"),
-            ),
-            F.when(
-                F.col("unit_price").isNull(),
-                F.lit("missign_unit_price"),
-            ),
-            F.when(
-                F.col("unit_price") < 0,
-                F.lit("unit_price_must_be_non_negative"),
-            ),
-            F.when(
-                F.col("customer_country").isNull()
-                | (F.trim(F.col("customer_country")) == ""),
-                F.lit("missing_customer_country")
-            ),
-        ),
-    )
-
-    valid_orders = (
+    return (
         validated
-        .filter(F.col("rejection_reason") == "")
-        .drop("_order_id_count", "rejection_reason")
-    )
-
-    rejected_orders = (
-        validated
-        .filter(F.col("rejection_reason") != "")
+        .withColumn(
+            "rejection_reason",
+            F.concat_ws(
+                ", ",
+                F.when(
+                    F.col("order_id").isNull(),
+                    F.lit("missing_order_id"),
+                ),
+                F.when(
+                    duplicate_condition,
+                    F.lit("duplicate_order_id"),
+                ),
+                F.when(
+                    F.col("order_date").isNull(),
+                    F.lit("missing_order_date"),
+                ),
+                F.when(
+                    F.col("quantity").isNull(),
+                    F.lit("missing_quantity"),
+                ),
+                F.when(
+                    F.col("quantity") <= 0,
+                    F.lit("quantity_must_be_positive"),
+                ),
+                F.when(
+                    F.col("unit_price").isNull(),
+                    F.lit("missign_unit_price"),
+                ),
+                F.when(
+                    F.col("unit_price") < 0,
+                    F.lit("unit_price_must_be_non_negative"),
+                ),
+                F.when(
+                    F.col("customer_country").isNull()
+                    | (F.trim(F.col("customer_country")) == ""),
+                    F.lit("missing_customer_country")
+                ),
+            ),
+        )
         .drop("_order_id_count")
     )
 
+def split_validated_orders(
+    validated: DataFrame
+) -> tuple[DataFrame, DataFrame]:
+    invalid_condition = F.col("rejection_reason") != ""
+
+    valid_orders = (
+        validated
+        .filter(~invalid_condition)
+        .drop("rejection_reason")
+    )
+
+    rejected_orders = validated.filter(invalid_condition)
+
     return valid_orders, rejected_orders
+
+def validate_orders(
+    orders: DataFrame
+) -> tuple[DataFrame, DataFrame]:
+    validated = build_validated_orders(orders)
+    return split_validated_orders(validated)
 
 def create_spark_session() -> SparkSession:
     return (
@@ -152,39 +162,56 @@ def main() -> None:
         print(f"Input partitions: {orders.rdd.getNumPartitions()}")
         show_partition_distribution(orders, "orders")
 
-        valid_orders, rejected_orders = validate_orders(orders)
+        validated_orders = build_validated_orders(orders).persist(
+            StorageLevel.MEMORY_AND_DISK
+            )
+    
+        try:
+            valid_orders, rejected_orders = split_validated_orders(validated_orders)
 
-        print("Input schema:")
-        orders.printSchema()
+            print("Input schema:")
+            orders.printSchema()
 
-        print("Rejected orders:")
-        rejected_orders.show(truncate=False)
+            print("Rejected orders:")
+            rejected_orders.show(truncate=False)
 
-        daily_revenue = calculate_daily_revenue(orders)
-        
-        print("Execution plan:")
-        daily_revenue.explain(mode="formatted")
+            daily_revenue = calculate_daily_revenue(orders)
 
-        print("Daily revenue:")
-        daily_revenue.show(truncate=False)
+            # First action: computes validation and fills the cache.
+            _ = valid_orders.count()
 
-        (
-            daily_revenue.write
-            .mode("overwrite")
-            .parquet(str(OUTPUT_DIRECTORY))
-        )
+            # Inspect a query that reads from the cached DataFrame. InMemoryTableScan, InMemoryRelation
+            print("Plan after caching:")
+            valid_orders.explain(mode="formatted")
 
-        (
-            valid_orders.write
-            .mode("overwrite")
-            .parquet("data/output/valid_orders")
-        )
+            # These subsequent actions can reuse the cache. InMemoryTableScan, InMemoryRelation
+            _ = rejected_orders.count()
+            
+            print("Execution plan:")
+            daily_revenue.explain(mode="formatted")
 
-        (
-            rejected_orders.write
-            .mode("overwrite")
-            .parquet("data/output/rejected_orders")
-        )
+            print("Daily revenue:")
+            daily_revenue.show(truncate=False)
+
+            (
+                daily_revenue.write
+                .mode("overwrite")
+                .parquet(str(OUTPUT_DIRECTORY))
+            )
+
+            (
+                valid_orders.write
+                .mode("overwrite")
+                .parquet("data/output/valid_orders")
+            )
+
+            (
+                rejected_orders.write
+                .mode("overwrite")
+                .parquet("data/output/rejected_orders")
+            )
+        finally:
+            validated_orders.unpersist()
 
         """
         filtered = orders.filter(
