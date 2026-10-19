@@ -102,6 +102,7 @@ def create_spark_session() -> SparkSession:
         SparkSession.builder
         .master("local[*]") # use all available local CPU
         .appName("spark-sales-pipeline")
+        .config("spark.sql.shuffle.partitions", "4")
         .getOrCreate()
     )
 
@@ -121,7 +122,20 @@ def calculate_daily_revenue(orders: DataFrame) -> DataFrame:
         .orderBy("order_date", "customer_country")
     )
         
+def show_partition_distribution(dataframe: DataFrame, name: str) -> None:
+    print(f"{name} partition distribution:")
 
+    (
+        dataframe
+        .withColumn(
+            "_partition_id",
+            F.spark_partition_id(),
+        )
+        .groupBy("_partition_id")
+        .count()
+        .orderBy("_partition_id")
+        .show()
+    )
 
 def main() -> None:
     spark = create_spark_session()
@@ -134,6 +148,9 @@ def main() -> None:
             .schema(ORDER_SCHEMA)
             .csv(str(INPUT_FILE))
         )
+
+        print(f"Input partitions: {orders.rdd.getNumPartitions()}")
+        show_partition_distribution(orders, "orders")
 
         valid_orders, rejected_orders = validate_orders(orders)
 
@@ -168,6 +185,36 @@ def main() -> None:
             .mode("overwrite")
             .parquet("data/output/rejected_orders")
         )
+
+        """
+        filtered = orders.filter(
+            F.col("quantity") > 0
+        )
+
+        grouped = orders.groupBy(
+            "customer_country"
+        ).count()
+
+        print("Filter plan:")
+        filtered.explain(mode="formatted")
+
+        print("Group plan:")
+        grouped.explain(mode="formatted")
+        repartitioned = orders.repartition(
+            4,
+            "customer_country",
+        )
+
+        print(
+            "Partitions after repartition:",
+            repartitioned.rdd.getNumPartitions(),
+        )
+
+        show_partition_distribution(
+            repartitioned,
+            "repartitioned orders",
+        )
+        """
     finally:
         spark.stop()
 
